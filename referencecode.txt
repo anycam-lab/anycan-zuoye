@@ -1,0 +1,639 @@
+def filter_depth(depth, threshold=0.1):
+    _, h, w = depth.shape
+
+    depth = depth.clone()[None, ...]
+    median = torch.median(depth)
+    
+    depth_grad = torch.stack(torch.gradient(depth, dim=(-2, -1))).norm(dim=0)
+
+    mask = depth_grad < median * threshold
+
+    return mask
+
+
+def visualize_rerun(trajectory, depths, imgs, proj, uncertainties=None, cam_every=1, depth_every=1, subsample_pts=16, step=0, uncertainty_thresh=-1, radii=1, track_masks=None, max_depth_masks=None, filter_depth_threshold=0.1, static_points_accumulate=False, highlight_dynamic=False, image_plane_distance=0.05):
+    h, w = imgs[0].shape[:2]
+
+    rr.set_time_sequence("step", step)
+
+    if cam_every > 0:
+        for i, d_id in enumerate(list(range(len(depths)))[cam_every//2::cam_every]):
+            if static_points_accumulate:
+                rr.set_time_sequence("step", d_id)
+
+            pose = trajectory[d_id]
+            rr.log(f"world/scene/cameras/{i:03d}", rr.Pinhole(
+                resolution=[w, h],
+                focal_length=float(proj[0, 0]),
+                image_plane_distance=image_plane_distance, 
+            ), static=not static_points_accumulate)
+            rr.log(f"world/scene/cameras/{i:03d}", rr.Transform3D(translation=pose[:3, 3].cpu(), mat3x3=pose[:3, :3].cpu(), axis_length=0.01), static=not static_points_accumulate)
+
+            depth_img = color_tensor(depths[d_id], cmap="plasma")[0]
+            depth_img = depth_img.cpu().numpy()
+            depth_img = (depth_img * 255).astype(np.uint8)
+
+            # rr.log(f"world/scene/cameras/{i:03d}/depth", rr.Image(depth_img).compress())
+
+            if uncertainties is not None:
+                uncertainty_img = color_tensor(uncertainties[d_id].clamp(max=torch.quantile(uncertainties[d_id], .95)), cmap="plasma", norm=True)[0]
+                uncertainty_img = uncertainty_img.cpu().numpy()
+                uncertainty_img = (uncertainty_img * 255).astype(np.uint8)
+
+                # rr.log(f"world/scene/cameras/{i:03d}/uncertainty", rr.Image(uncertainty_img).compress())
+
+            rr.log(f"world/scene/cameras/{i:03d}/input", rr.Image((imgs[d_id] * 255).astype(np.uint8)).compress(jpeg_quality=95), static=not static_points_accumulate)
+
+            if highlight_dynamic > 0 and (d_id - cam_every//2) % cam_every == 0:
+                pts, colors = lift_image(torch.tensor(imgs[d_id]).cuda(), depths[d_id].cuda(), trajectory[d_id].cuda(), proj)
+                dyn_mask = uncertainties[d_id].view(-1) > highlight_dynamic
+                dyn_mask = dyn_mask & filter_depth(depths[d_id].cuda(), threshold=filter_depth_threshold).view(-1)
+
+                pts_dyn = pts[dyn_mask, :]
+                colors_dyn = colors[dyn_mask, :]
+
+                colors_dyn = colors_dyn * .5 + colors_dyn.new_tensor((1, 0, 0)) * .5
+
+                colors_dyn = (colors_dyn * 255).clamp(0, 255).to(torch.uint8)
+
+                rr.log(f"world/scene/points/{i:03d}_dyn", rr.Points3D(pts_dyn[:, :3].cpu().numpy(), colors=colors_dyn[:, :3].cpu().numpy(), radii=rr.Radius.ui_points([radii]),), static=not static_points_accumulate)
+
+
+    xyz_min, xyz_max = None, None
+
+    for i, t_id in enumerate(list(range(len(depths)))[depth_every//2::depth_every]):
+        pts, colors = lift_image(torch.tensor(imgs[t_id]).cuda(), depths[t_id].cuda(), trajectory[t_id].cuda(), proj)
+        mask = filter_depth(depths[t_id].cuda(), threshold=filter_depth_threshold)
+
+        mask = mask.view(-1)
+
+        mask = mask & (depths[t_id].cuda().view(-1) < 10)
+
+        if uncertainty_thresh > 0:
+            mask = mask & (uncertainties[t_id].view(-1) < uncertainty_thresh)
+
+        if track_masks is not None:
+            mask = mask & track_masks[t_id].view(-1)
+
+        if max_depth_masks is not None:
+            mask = mask & max_depth_masks[t_id].view(-1)           
+
+        pts_filtered = pts[mask, :]
+        colors_filtered = colors[mask, :]
+
+        pts_filtered = pts_filtered[subsample_pts//2::subsample_pts]
+        colors_filtered = colors_filtered[subsample_pts//2::subsample_pts]
+
+        if static_points_accumulate:
+            rr.set_time_sequence("step", t_id)
+
+        colors_filtered = (colors_filtered * 255).clamp(0, 255).to(torch.uint8)
+
+        rr.log(f"world/scene/points/{i:03d}", rr.Points3D(pts_filtered[:, :3].cpu().numpy(), colors=colors_filtered[:, :3].cpu().numpy(), radii=rr.Radius.ui_points([radii]),), static=not static_points_accumulate)
+    
+
+        if xyz_min is None and pts_filtered.shape[0] > 0:
+            xyz_min = pts_filtered.min(dim=0).values
+            xyz_max = pts_filtered.max(dim=0).values
+        elif pts_filtered.shape[0] > 0:
+            xyz_min = torch.min(xyz_min, pts_filtered.min(dim=0).values)
+            xyz_max = torch.max(xyz_max, pts_filtered.max(dim=0).values)
+
+    return xyz_min, xyz_max
+
+
+def visualize_video_rerun(
+        trajectory, 
+        depths, 
+        imgs, 
+        proj,
+        uncertainties=None, 
+        cam_every=-1, 
+        depth_every=1, 
+        subsample_pts=1, 
+        subsample_dynamic_pts=1, 
+        step=0, 
+        radii=1.5, 
+        uncertainty_thresh=-1, 
+        track_masks=None, 
+        max_depth_masks=None, 
+        follow_cam=None, 
+        filter_depth_threshold=0.1,
+        static_points_accumulate=False,
+        highlight_dynamic=False,
+        image_plane_distance=0.05,
+        ):
+    h, w = imgs[0].shape[:2]
+
+    imgs = np.array(imgs)
+
+    # imgs_grey = (imgs.astype(float) * .5 + .5)
+    imgs_grey = imgs
+
+    xyz_min, xyz_max = visualize_rerun(
+        trajectory, 
+        depths, 
+        imgs_grey, 
+        proj, 
+        uncertainties, 
+        cam_every=cam_every, 
+        depth_every=depth_every, 
+        subsample_pts=subsample_pts, 
+        step=step, 
+        uncertainty_thresh=uncertainty_thresh, 
+        radii=radii, 
+        track_masks=track_masks, 
+        max_depth_masks=max_depth_masks, 
+        filter_depth_threshold=filter_depth_threshold,
+        static_points_accumulate=static_points_accumulate,
+        highlight_dynamic=highlight_dynamic,
+        image_plane_distance=image_plane_distance,
+        )
+
+    for t_id in range(len(depths)):
+        rr.set_time_sequence("step", t_id+step)
+
+        pts, colors = lift_image(torch.tensor(imgs[t_id]).cuda(), depths[t_id].cuda() - 0.01, trajectory[t_id].cuda(), proj)
+        mask = filter_depth(depths[t_id].cuda(), threshold=filter_depth_threshold)
+
+        mask = mask.view(-1)
+
+        mask = mask & (uncertainties[t_id].view(-1) >= uncertainty_thresh)
+
+        if max_depth_masks is not None:
+            mask = mask & max_depth_masks[t_id].view(-1)
+
+        pts = pts[mask, :]
+        colors = colors[mask, :]
+
+        pts = pts[subsample_dynamic_pts//2::subsample_dynamic_pts]
+        colors = colors[subsample_dynamic_pts//2::subsample_dynamic_pts]
+        colors = (colors * 255).clamp(0, 255).to(torch.uint8)
+
+        if xyz_min is None and pts.shape[0] > 0:
+            xyz_min = pts.min(dim=0).values
+            xyz_max = pts.max(dim=0).values
+        elif pts.shape[0] > 0:
+            xyz_min = torch.min(xyz_min, pts.min(dim=0).values)
+            xyz_max = torch.max(xyz_max, pts.max(dim=0).values)
+
+        rr.log(f"world/scene/active_points", rr.Points3D(pts[:, :3].cpu().numpy(), colors=colors[:, :3].cpu().numpy(), radii=rr.Radius.ui_points([radii]),))
+
+        pose = trajectory[t_id]
+        rot = quaternion_to_matrix(matrix_to_quaternion(pose[:3, :3].cpu()))
+
+        rr.log(f"world/scene/active_cam", rr.Pinhole(
+            resolution=[w, h],
+            focal_length=float(proj[0, 0]),
+            image_plane_distance=image_plane_distance, 
+        ), static=True)
+        rr.log(f"world/scene/active_cam", rr.Transform3D(translation=pose[:3, 3].cpu(), mat3x3=rot, axis_length=0.01))
+
+        rr.log("world/scene/cam_traj", rr.LineStrips3D([pose[:3, 3].cpu().numpy().tolist() for pose in trajectory[:t_id+1]], colors=[(0, 255, 0)]), static=False)
+
+        rr.log("world/scene/active_cam/input", rr.Image((imgs[t_id] * 255).astype(np.uint8)).compress(jpeg_quality=95))
+        
+        if uncertainties is not None:
+            uncertainty_img = color_tensor((uncertainties[t_id] / 0.05).clamp(0, 1), cmap="plasma", norm=False)[0]
+            uncertainty_img = uncertainty_img.cpu().numpy()
+            uncertainty_img = (uncertainty_img * 255).astype(np.uint8)
+
+            rr.log(f"world/scene/active_cam/uncertainty", rr.Image(uncertainty_img).compress())
+
+
+        if follow_cam == "world":
+            rr.log("world/scene", rr.Transform3D(translation=pose[:3, 3].cpu(), mat3x3=rot, axis_length=0, from_parent=True))
+
+        elif follow_cam is not None:
+            fc_t, fc_a = follow_cam
+            rr.log(f"world/scene/ac/follow_cam", rr.Pinhole(
+                resolution=[1280, 720],
+                focal_length=1280,
+                image_plane_distance=0.02, 
+            ), static=True)
+            rr.log(f"world/scene/ac", rr.Transform3D(translation=pose[:3, 3].cpu(), mat3x3=rot, axis_length=0.01))
+            rr.log(f"world/scene/ac/follow_cam", rr.Transform3D(translation=fc_t, rotation=rr.RotationAxisAngle(axis=[0, 1, 0], angle=rr.Angle(deg=fc_a)) ,axis_length=0.01))
+
+    xyz_abs_max = torch.max(torch.abs(xyz_min), torch.abs(xyz_max)).cpu()
+    bbox_pts = torch.tensor([
+        [-1, -1, -1],
+        [1, -1, -1],
+        [1, 1, -1],
+        [-1, 1, -1],
+        [-1, -1, 1],
+        [1, -1, 1],
+        [1, 1, 1],
+        [-1, 1, 1],
+    ]) * xyz_abs_max
+
+    # rr.log("world/scene/bbox", rr.Points3D(bbox_pts.numpy(), colors=[(255, 255, 255)]), static=True)
+from anycam.common.geometry import get_grid_xy
+
+
+def get_normals(depth, proj):
+    # Get grid
+
+    n, _, h, w = depth.shape
+
+    xy = get_grid_xy(h, w, homogeneous=True, device=depth.device)
+
+    # Project to 3D
+    pts = torch.inverse(proj) @ xy.reshape(3, -1)
+
+    pts = pts * depth.view(n, 1, -1)
+
+    # Get normals
+    pts = pts.reshape(n, 3, h, w)
+
+    dx, dy = torch.gradient(pts, dim=(-2, -1))
+
+    n = torch.cross(dx, dy, dim=1)
+
+    n = n / n.norm(dim=1, keepdim=True)
+
+    return n
+
+
+def lift_image(img, depth, pose, proj):
+    h, w = img.shape[:2]
+
+    proj = torch.tensor(proj, device=device).float()
+
+    proj[0, 0] = proj[0, 0] / w * 2
+    proj[1, 1] = proj[1, 1] / h * 2
+    proj[0, 2] = proj[0, 2] / w * 2 - 1
+    proj[1, 2] = proj[1, 2] / h * 2 - 1
+
+    inv_proj = torch.inverse(proj)
+
+    pts = get_grid_xy(h, w, homogeneous=True).reshape(3, h*w).cuda()
+    pts = inv_proj @ pts
+    pts = pts * depth.view(1, -1).cuda()
+    pts = torch.cat((pts, torch.ones(1, h*w, device=device)), dim=0)
+    pts = pose @ pts
+    pts = pts[:3, :].T
+
+    colors = torch.tensor(img.reshape(-1, 3)).cuda()
+
+    return pts, colors
+def get_depth_flow(imgs, model):
+    depths = []
+    flow_occs_fwd = []
+    flow_occs_bwd = []
+
+    c, h, w = imgs.shape[1:]
+
+    with torch.no_grad():
+        for i in tqdm(range(len(imgs)-1)):
+            img0 = imgs[i]
+            img1 = imgs[i+1]
+
+            imgs_ = torch.stack([img0, img1]).unsqueeze(0).cuda()
+
+            images_ip_fwd, images_ip_bwd = model.image_processor(imgs_ * 2 - 1, data={})
+
+            flow_occs_fwd.append(images_ip_fwd[0, :(1 if i != len(imgs)-2 else 2), 3:6].cpu())
+            flow_occs_bwd.append(images_ip_bwd[0, (1 if i != 0 else 0):, 3:6].cpu())
+
+            depth = model.depth_predictor(img0.unsqueeze(0).cuda())
+
+            depth = 1 / depth[0].clamp_min(1e-3)
+
+            depths.append(depth.cpu())
+
+        depth = model.depth_predictor(imgs[-1].unsqueeze(0).cuda())
+        depth = 1 / depth[0].clamp_min(1e-3)
+
+        depths.append(depth.cpu())
+
+    seq_depths = torch.cat(depths, dim=0)
+    seq_flow_occs_fwd = torch.cat(flow_occs_fwd, dim=0)
+    seq_flow_occs_bwd = torch.cat(flow_occs_bwd, dim=0)
+
+    return seq_depths, seq_flow_occs_fwd, seq_flow_occs_bwd
+from depthcrafter.depth_crafter_ppl import DepthCrafterPipeline
+from depthcrafter.unet import DiffusersUNetSpatioTemporalConditionModelDepthCrafter
+
+
+def get_depth_crafter():
+    unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
+        "tencent/DepthCrafter",
+        low_cpu_mem_usage=True,
+        torch_dtype=torch.float16,
+    )
+    pipe = DepthCrafterPipeline.from_pretrained(
+        "stabilityai/stable-video-diffusion-img2vid-xt",
+        unet=unet,
+        torch_dtype=torch.float16,
+        variant="fp16",
+    )
+    pipe.to("cuda")
+    return pipe
+
+def depth_crafter_inference(pipe, imgs):
+    # imgs = imgs.permute(0, 2, 3, 1).float().cuda()
+    n, h, w, c = imgs.shape
+
+    imgs = imgs.permute(0, 3, 1, 2)
+
+    th = math.ceil(h / 128) * 128
+    tw = math.ceil(w / 128) * 128
+
+    imgs = F.interpolate(imgs, (th, tw))
+
+    imgs = imgs.permute(0, 2, 3, 1).cpu().numpy()
+
+    res = pipe(
+            imgs,
+            height=imgs.shape[1],
+            width=imgs.shape[2],
+            output_type="np",
+            guidance_scale=1,
+            num_inference_steps=5,
+            window_size=110,
+            overlap=25,
+            track_time=True,
+        ).frames[0]
+
+    res = res.sum(-1) / res.shape[-1]
+
+    res = F.interpolate(torch.tensor(res, device="cuda").unsqueeze(1), (h, w)).cpu()
+
+    res = 1 / res
+
+    return res
+def depth_alignment(depths_uni, depths_dc, uncertainties):
+    n, _, h, w = depths_uni.shape
+
+    depths_uni_opt = depths_uni[:-1].reshape(-1).cuda()
+    depths_dc_opt = depths_dc[:-1].reshape(-1).cuda()
+    uncertainties = uncertainties.reshape(-1)
+
+    mask = (depths_uni_opt > 0) & (depths_uni_opt < 50)
+
+    depths_uni_opt = depths_uni_opt[mask]
+    depths_dc_opt = depths_dc_opt[mask]
+    uncertainties = uncertainties[mask]
+
+    depths_uni_opt = 1 / depths_uni_opt
+    depths_dc_opt = 1 / depths_dc_opt
+
+    A = torch.stack([depths_dc_opt, torch.ones_like(depths_dc_opt)], dim=1)
+    b = depths_uni_opt.view(-1, 1)
+
+    weight = 1 / uncertainties.clamp_min(1e-3)
+    weight = weight.view(-1, 1)
+
+    A = A * weight
+    b = b * weight
+
+    x = torch.linalg.lstsq(A, b).solution
+
+    scale = x[0]
+    shift = x[1]
+
+    print(f"Aligning with scale {scale.item()} and shift {shift.item()}")
+
+    depths_dc_aligned = 1 / ((1 / depths_dc.cuda()) * scale + shift).clamp_min(1e-3)
+
+    return depths_dc_aligned.cpu()
+def compute_track_masks(flow_occs, uncertainties, max_track_len=8, uncertainty_thresh=0.1, min_track_len=1, plot_rerun=False, imgs=None):
+    n, _, h, w = flow_occs.shape
+    device = flow_occs.device
+
+    masks = torch.zeros_like(flow_occs[:, :1, :, :])
+    tracks = torch.zeros((0, 2), device=device, dtype=torch.long)
+    track_lens = torch.zeros((0,), device=device, dtype=torch.long)
+    track_starts = torch.zeros((0, 3), device=device, dtype=torch.float)
+
+    
+    if plot_rerun:
+        rr.init("Track Masks", recording_id=uuid.uuid4())
+        rr.connect()
+
+    for i_curr_frame in range(n):
+        if plot_rerun:
+            rr.set_time_sequence("step", i_curr_frame)
+            rr.log("2d/img", rr.Image((imgs[i_curr_frame] * 255).astype(np.uint8)).compress())
+
+        # If maximum track length has been reached, clear the track
+        len_mask = track_lens < max_track_len
+
+        tracks = tracks[len_mask]
+        track_lens = track_lens[len_mask]
+        track_starts = track_starts[len_mask]
+
+
+        # Create mask of pixels that are currently being tracked
+
+        tracked_pixels = torch.zeros_like(masks[0, 0], dtype=torch.bool)
+
+        tracked_pixels[tracks[:, 1], tracks[:, 0]] = True
+
+        
+        # Add new tracks for untracked pixels
+
+        x = torch.arange(w, device=device).view(1, -1).expand(h, -1)
+        y = torch.arange(h, device=device).view(-1, 1).expand(-1, w)
+        xy = torch.stack([x, y], dim=-1).view(-1, 2)
+
+        new_tracks = xy[~tracked_pixels.view(-1), :]
+        new_track_lens = torch.ones_like(new_tracks[:, 0])
+        new_track_starts = torch.cat([new_tracks, i_curr_frame * torch.ones_like(new_tracks[:, 0]).view(-1, 1)], dim=1)
+
+
+        # Filter both tracks and new tracks by uncertainty
+
+        track_uncs = uncertainties[i_curr_frame, 0, tracks[:, 1], tracks[:, 0]]
+        new_track_uncs = uncertainties[i_curr_frame, 0, new_tracks[:, 1], new_tracks[:, 0]]
+
+        tracks = tracks[track_uncs < uncertainty_thresh]
+        track_lens = track_lens[track_uncs < uncertainty_thresh]
+        track_starts = track_starts[track_uncs < uncertainty_thresh]
+
+        new_tracks = new_tracks[new_track_uncs < uncertainty_thresh]
+        new_track_lens = new_track_lens[new_track_uncs < uncertainty_thresh]
+        new_track_starts = new_track_starts[new_track_uncs < uncertainty_thresh]
+
+        if plot_rerun:
+            rr.log("2d/tracks", rr.Points2D(tracks.cpu().numpy(), colors=[(255, 255, 0)]))
+            rr.log("2d/new_tracks", rr.Points2D(new_tracks.cpu().numpy(), colors=[(0, 255, 0)]))
+
+
+        # Add new tracks to track list
+        tracks = torch.cat([tracks, new_tracks], dim=0)
+        track_lens = torch.cat([track_lens, new_track_lens], dim=0)
+        track_starts = torch.cat([track_starts, new_track_starts], dim=0)
+
+
+        # Register new tracks in mask
+
+        # masks[i_curr_frame, 0, new_tracks[:, 1], new_tracks[:, 0]] = True
+        
+        register_mask = track_lens == min_track_len
+
+        masks[i_curr_frame, 0, tracks[register_mask, 1], tracks[register_mask, 0]] = True
+
+
+        # Check if track is occluded. If so, remove it
+
+        track_occs = flow_occs[i_curr_frame, 2, :, :][tracks[:, 1], tracks[:, 0]] > .5
+
+
+        if plot_rerun:
+            rr.log("2d/occluded_tracks", rr.Points2D(tracks[~track_occs].cpu().numpy(), colors=[(255, 0, 0)]))
+
+
+        tracks = tracks[track_occs]
+        track_lens = track_lens[track_occs]
+        track_starts = track_starts[track_occs]
+
+
+        # Compute flow for tracked pixels
+
+        track_flow_x = flow_occs[i_curr_frame, 0, :, :][tracks[:, 1], tracks[:, 0]]
+        track_flow_y = flow_occs[i_curr_frame, 1, :, :][tracks[:, 1], tracks[:, 0]]
+
+        track_flow_x = track_flow_x * w
+        track_flow_y = track_flow_y * h
+
+        track_flow = torch.stack([track_flow_x, track_flow_y], dim=-1)
+
+        tracks = tracks.float() + track_flow
+        tracks = tracks.round().long()
+
+
+        # Check if track is out of bounds. If so, remove it
+
+        out_of_bounds = (tracks[:, 0] < 0) | (tracks[:, 0] >= w) | (tracks[:, 1] < 0) | (tracks[:, 1] >= h)
+
+        tracks = tracks[~out_of_bounds]
+        track_lens = track_lens[~out_of_bounds]
+        track_starts = track_starts[~out_of_bounds]
+
+        
+        # Update track_lens
+
+        track_lens += 1
+
+
+    return masks
+from anycam.datasets.davis.davis_dataset import DavisDataset
+
+
+davis = DavisDataset(
+    data_path="E:\AnyCam\my_data",
+    split_path=None,
+    image_size=[336, int(16/9*336)],
+    # image_size=336,
+    frame_count=2,
+    return_depth=False,
+    return_flow=False,
+    dilation=1,
+    index_selector=get_index_selector(True),
+    flow_selector=get_flow_selector(1, True)
+)
+from anycam.scripts.common import load_model
+from anycam.loss import make_loss
+from anycam.trainer import AnyCamWrapper
+
+def load_anycam(model_path, checkpoint=None):
+    with initialize(version_base=None, config_path=str("../.." / model_path), job_name="test_app"):
+        config = compose(config_name="training_config")
+
+    prefix = "training_checkpoint_"
+    ckpts = Path(model_path).glob(f"{prefix}*.pt")
+
+    model_conf = config["model"]
+    model_conf["use_provided_flow"] = False
+    model_conf["train_directions"] = "forward"
+
+    model = AnyCamWrapper(model_conf)
+
+    criterion = [make_loss(cfg) for cfg in config.get("loss", [])][0]
+
+    training_steps = [int(ckpt.stem.split(prefix)[1]) for ckpt in ckpts]
+
+    print(training_steps)
+    if training_steps:
+        if checkpoint is None:
+            ckpt_path = f"{prefix}{max(training_steps)}.pt"
+        else:
+            ckpt_path = checkpoint
+
+        # ckpt_path = Path(config["output"]["path"]) / ckpt_path
+        ckpt_path = Path(model_path) / ckpt_path
+
+        print(ckpt_path)
+
+        cp = torch.load(ckpt_path, map_location="cpu")
+
+        cp["model"] = {k: v for k, v in cp["model"].items() if not "depth_predictor" in k}
+
+        model.load_state_dict(cp["model"], strict=False)
+
+    return model, criterion
+
+
+run_name = "anycam_seq8"
+
+# model_path = Path("out/vacation_runs") / run_name
+model_path = Path("pretrained_models") / run_name
+
+device = "cuda"
+
+dataset = davis
+sequence = "my_video"
+
+# ids = list(range(515, 575))
+# ids = list(range(896, 960)) + list(range(1920, 1984))
+ids, _ = get_ids_for_sequence(dataset, sequence)
+# ids = [i for i, dp in enumerate(dataset._datapoints) if dataset._datapoints[0][0] == dp[0]]
+
+# ids = ids[80:280]
+
+print(f"Found {len(ids)} datapoints")
+
+# imgs = []
+# poses = []
+# proj = None
+
+# gt_proj = None
+
+# for id in ids:
+#     data = dataset[id]
+#     imgs.append(data["imgs"][0].transpose(1, 2, 0))
+#     poses.append(data["poses"][0])
+#     proj = data["projs"][0]
+
+out_path = Path("media") / "anycam" / f"{dataset.NAME.strip()}_{run_name}"
+out_path.mkdir(exist_ok=True, parents=True)
+# Export to input images, depth, flow, and uncertainties to video and frames
+
+import cv2
+from moviepy import VideoClip
+
+def save_to_video_and_frames(frames, out_path, fps=30):
+    out_path.mkdir(exist_ok=True, parents=True)
+    frames_dir = out_path / "frames"
+    frames_dir.mkdir(exist_ok=True, parents=True)
+
+    for i, frame in enumerate(frames):
+        cv2.imwrite(str(frames_dir / f"{i:04d}.png"), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+    clip = VideoClip(lambda t: frames[int(t * fps)], duration=len(frames) / fps)
+    clip.write_videofile(str(out_path / "video.mp4"), codec="libx264", fps=fps)
+
+def save_all(out_path, imgs, depths, uncertainties, flows_occs_fwd, fps=30):
+    save_to_video_and_frames([(img * 255).astype(np.uint8) for img in imgs], out_path / "imgs", fps)
+
+    depths_c = [(color_tensor(((1 / (depths[i, 0] * 10)) * 5).clamp(0, 1), cmap="plasma", norm=False) * 255).numpy().astype(np.uint8) for i in range(len(depths))]
+    save_to_video_and_frames(depths_c, out_path / "depths", fps)
+
+    uncertainties_c = [(color_tensor((uncertainties[i, 0] / 0.08).clamp(0, 1), cmap="plasma", norm=False) * 255).numpy().astype(np.uint8) for i in range(len(uncertainties))]
+    save_to_video_and_frames(uncertainties_c, out_path / "uncertainties", fps)
+
+    flows = flow_to_image(flows_occs_fwd[:, :2].cpu()).permute(0, 2, 3, 1).numpy()
+    save_to_video_and_frames(flows, out_path / "flows_occs_fwd", fps)
+
+save_all(Path("media/anycam/4D/running_dog_pexels"), imgs, depths_dc_uni, uncertainties, seq_flows_occs_fwd, fps=15)

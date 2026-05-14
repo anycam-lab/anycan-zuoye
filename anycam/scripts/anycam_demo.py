@@ -269,7 +269,7 @@ def plot_to_rerun(
     rr.send_blueprint(blueprint, make_active=True)
 
     for id in range(len(trajectory)):
-        rr.set_time_sequence("step", id)
+        rr.set_time_seconds("step", id)
 
 
         pose = trajectory[id]
@@ -459,16 +459,17 @@ def main(cfg: DictConfig):
         np.save(output_path / "trajectory.npy", trajectory_np)
         
         # Save projection matrix
-        np.save(output_path / "projection.npy", proj.cpu().numpy())
+        proj_np = proj.cpu().numpy() if torch.is_tensor(proj) else proj
+        np.save(output_path / "projection.npy", proj_np)
         
         # Save depths if available
-        if depths:
-            depths_np = np.stack([depth.cpu().numpy() for depth in depths])
+        if depths is not None and len(depths) > 0:
+            depths_np = np.stack([d.cpu().numpy() if torch.is_tensor(d) else d for d in depths])
             np.save(output_path / "depths.npy", depths_np)
         
         # Save uncertainties if available
-        if uncertainties is not None:
-            uncertainties_np = np.stack([uncert.cpu().numpy() for uncert in uncertainties])
+        if uncertainties is not None and len(uncertainties) > 0:
+            uncertainties_np = np.stack([uncert.cpu().numpy() if torch.is_tensor(uncert) else uncert for uncert in uncertainties])
             np.save(output_path / "uncertainties.npy", uncertainties_np)
             
         print("Saved all results successfully")

@@ -1,0 +1,4 @@
+python anycam/scripts/anycam_demo.py \
+    ++input_path=video.mp4 \ 
+    ++model_path=pretrained_models/anycam_seq8 \
+    ++visualize=true
